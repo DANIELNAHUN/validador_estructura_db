@@ -180,4 +180,7 @@ pyrightconfig.json
 *.xlsx
 *.csv
 
+# SQL script
+*.sql
+
 # End of https://www.toptal.com/developers/gitignore/api/python

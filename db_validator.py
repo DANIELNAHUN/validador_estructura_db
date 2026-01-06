@@ -153,6 +153,87 @@ def compare_databases(df1, df2):
 
     return pd.DataFrame(diffs)
 
+def generate_sync_sql(diff_df, engine1):
+    """
+    Generates SQL statements to synchronize DB2 to match DB1.
+    """
+    if diff_df.empty:
+        return ""
+
+    sql_statements = []
+    
+    # Connect to DB1 to get definitions
+    try:
+        with engine1.connect() as conn:
+            
+            # Group differences by table
+            grouped = diff_df.groupby("Table")
+            
+            for table_name, group in grouped:
+                # Check for Missing Table
+                missing_table_row = group[group["Difference Type"] == "Missing Table in DB2"]
+                if not missing_table_row.empty:
+                    print(f"Generating CREATE TABLE for {table_name}...")
+                    try:
+                        result = conn.execute(text(f"SHOW CREATE TABLE {table_name}"))
+                        create_stmt = result.fetchone()[1]
+                        # Replace CREATE TABLE with CREATE TABLE IF NOT EXISTS potentially, 
+                        # but standard CREATE is fine as we know it's missing.
+                        sql_statements.append(f"-- Missing Table: {table_name}")
+                        sql_statements.append(f"{create_stmt};\n")
+                    except Exception as e:
+                        sql_statements.append(f"-- Error generating CREATE TABLE for {table_name}: {e}")
+                    # If table is missing, no need to check for columns on it
+                    continue
+                
+                # Check for Missing Columns or Mismatches
+                for _, row in group.iterrows():
+                    diff_type = row["Difference Type"]
+                    column = row["Column"]
+                    
+                    if diff_type == "Missing Column in DB2":
+                        print(f"Generating ADD COLUMN for {table_name}.{column}...")
+                        try:
+                            # Get column definition from DB1
+                            # SHOW COLUMNS returns: Field, Type, Null, Key, Default, Extra
+                            col_info = conn.execute(text(f"SHOW COLUMNS FROM {table_name} WHERE Field = '{column}'")).fetchone()
+                            if col_info:
+                                field, col_type, null, key, default, extra = col_info
+                                
+                                null_str = "NOT NULL" if null == "NO" else "NULL"
+                                default_str = f"DEFAULT '{default}'" if default is not None else ""
+                                if default is None and null == "YES":
+                                     default_str = "DEFAULT NULL"
+                                
+                                sql = f"ALTER TABLE `{table_name}` ADD COLUMN `{column}` {col_type} {null_str} {default_str} {extra};"
+                                sql_statements.append(f"-- Missing Column: {table_name}.{column}")
+                                sql_statements.append(sql)
+                        except Exception as e:
+                            sql_statements.append(f"-- Error getting definition for {table_name}.{column}: {e}")
+                            
+                    elif diff_type in ["Type Mismatch", "Nullable Mismatch"]:
+                        print(f"Generating MODIFY COLUMN for {table_name}.{column}...")
+                        try:
+                            col_info = conn.execute(text(f"SHOW COLUMNS FROM {table_name} WHERE Field = '{column}'")).fetchone()
+                            if col_info:
+                                field, col_type, null, key, default, extra = col_info
+                                
+                                null_str = "NOT NULL" if null == "NO" else "NULL"
+                                default_str = f"DEFAULT '{default}'" if default is not None else ""
+                                if default is None and null == "YES":
+                                     default_str = "DEFAULT NULL"
+
+                                sql = f"ALTER TABLE `{table_name}` MODIFY COLUMN `{column}` {col_type} {null_str} {default_str} {extra};"
+                                sql_statements.append(f"-- Mismatch: {table_name}.{column} ({diff_type})")
+                                sql_statements.append(sql)
+                        except Exception as e:
+                            sql_statements.append(f"-- Error getting definition for {table_name}.{column}: {e}")
+
+    except Exception as e:
+        return f"-- Error connecting to DB1 for SQL generation: {e}"
+
+    return "\n".join(sql_statements)
+
 def main():
     # Get database URLs from .env
     db_url_1 = os.getenv("DATABASE_URL1")
@@ -189,6 +270,17 @@ def main():
     # Compare Databases
     print("Comparing databases...")
     df_diff = compare_databases(df1, df2)
+    
+    # Generate Sync SQL
+    if not df_diff.empty and db_url_1:
+        print("Generating synchronization SQL script...")
+        engine1 = create_engine(db_url_1)
+        sql_script = generate_sync_sql(df_diff, engine1)
+        
+        sql_output_file = "script_sincronizacion.sql"
+        with open(sql_output_file, "w", encoding="utf-8") as f:
+            f.write(sql_script)
+        print(f"Successfully generated SQL script: {sql_output_file}")
     
     output_file = "estructura_base_datos.xlsx"
     
